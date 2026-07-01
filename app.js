@@ -10,19 +10,16 @@ const LokiTransport = require('winston-loki');
 // Grafana Loki için Logger (Loglayıcı) oluşturuyoruz
 const logger = winston.createLogger({
   transports: [
-   new LokiTransport({
-  // localhost yerine bunu yazıyoruz:
-  host: 'http://127.0.0.1:3100', 
-  labels: { app: 'magaza-backend-servisi' }, 
-  json: true
-}),
+    new LokiTransport({
+      host: 'http://127.0.0.1:3100', 
+      labels: { app: 'magaza-backend-servisi' }, 
+      json: true
+    }),
     new winston.transports.Console({ // Logları aynı zamanda terminalde de görmek için
       format: winston.format.simple()
     })
   ]
 });
-
-// Artık kod içinde console.log yerine logger.info() veya logger.error() kullanacağız!
 
 const app = express();
 app.use(express.json());
@@ -53,9 +50,7 @@ const URUNLER = [
 
 let SEPET = [];
 
-// -------------------------------------------------------------------------
-// TERTEMİZ ARAYÜZ (Takip Paneli Tamamen Kaldırıldı)
-// -------------------------------------------------------------------------
+// --- TERTEMİZ ARAYÜZ ---
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -209,7 +204,9 @@ app.get('/urunler', async (req, res) => {
   span.end();
   res.json(URUNLER);
 });
+
 logger.info({ message: 'Mağaza backend servisi Loki loglama sistemi başarıyla tetiklendi!' });
+
 app.post('/sepet/ekle', async (req, res) => {
   const { urunId } = req.body;
   const span = tracer.startSpan('Sepete_Urun_Ekleme_Islemi');
@@ -229,47 +226,48 @@ app.delete('/sepet/sil', async (req, res) => {
   res.json(SEPET);
 });
 
+// 🚀 EN KRİTİK GÜNCELLEME: startActiveSpan kullanarak akışı Context'e bağlıyoruz!
 app.post('/siparis-ver', async (req, res) => {
-  const anaSpan = tracer.startSpan('Eticaret_Siparis_Ana_Sureci');
-  let toplamTutar = SEPET.reduce((toplam, urun) => toplam + urun.fiyat, 0);
+  await tracer.startActiveSpan('Eticaret_Siparis_Ana_Sureci', async (anaSpan) => {
+    let toplamTutar = SEPET.reduce((toplam, urun) => toplam + urun.fiyat, 0);
 
-  anaSpan.setAttribute('siparis.toplam_tutar', toplamTutar);
-  anaSpan.setAttribute('siparis.urun_adedi', SEPET.length);
+    anaSpan.setAttribute('siparis.toplam_tutar', toplamTutar);
+    anaSpan.setAttribute('siparis.urun_adedi', SEPET.length);
 
-  try {
-    const stokSpan = tracer.startSpan('Stok_Guncelleme_Servisi', { parent: anaSpan });
-    await bekle(300);
-    stokSpan.end();
+    try {
+      const stokSpan = tracer.startSpan('Stok_Guncelleme_Servisi', { parent: anaSpan });
+      await bekle(300);
+      stokSpan.end();
 
-    const odemeSpan = tracer.startSpan('Banka_Odeme_Ag_Gecidi', { parent: anaSpan });
-    await bekle(500);
+      const odemeSpan = tracer.startSpan('Banka_Odeme_Ag_Gecidi', { parent: anaSpan });
+      await bekle(500);
 
-    // 🎯 Dinamik limit kontrolü ve string tip dönüşümü
-    const KART_LIMITI = 6000;
-    if (toplamTutar > KART_LIMITI) {
-      hataSayaci.add(1, { 'hata.tipi': 'limit_asimi', 'sepet.tutar': String(toplamTutar) });
-      throw new Error(`Banka Reddi: Yetersiz Limit! Sepet toplamınız (${toplamTutar} TL), kart limitinizi (${KART_LIMITI} TL) aşıyor.`);
+      const KART_LIMITI = 6000;
+      if (toplamTutar > KART_LIMITI) {
+        hataSayaci.add(1, { 'hata.tipi': 'limit_asimi', 'sepet.tutar': String(toplamTutar) });
+        throw new Error(`Banka Reddi: Yetersiz Limit! Sepet toplamınız (${toplamTutar} TL), kart limitinizi (${KART_LIMITI} TL) aşıyor.`);
+      }
+      
+      odemeSpan.end();
+      basariliSiparisSayaci.add(1, { 'islem.durumu': 'basarili' });
+
+      SEPET = [];
+      res.json({ success: true, message: `Ödemeniz alındı! Toplam ${toplamTutar} TL başarıyla tahsil edildi.` });
+
+    } catch (error) {
+      const traceId = anaSpan.spanContext().traceId;
+      
+      // Hem terminal logu hem Loki logu artık jilet gibi traceId değerini alacak
+      console.error(`🚨 [HATA] [TraceID: ${traceId}] İşlem Başarısız: ${error.message}`);
+      logger.error({ message: `Sistemde kritik bir hata oluştu: ${error.message} trace_id=${traceId}` });
+
+      anaSpan.setStatus({ code: opentelemetry.SpanStatusCode.ERROR, message: error.message });
+      anaSpan.recordException(error);
+      res.status(400).json({ success: false, message: error.message });
+    } finally {
+      anaSpan.end();
     }
-    
-    // Eğer limit aşılmadıysa süreç başarılı devam eder
-    odemeSpan.end();
-    basariliSiparisSayaci.add(1, { 'islem.durumu': 'basarili' });
-
-    SEPET = [];
-    res.json({ success: true, message: `Ödemeniz alındı! Toplam ${toplamTutar} TL başarıyla tahsil edildi.` });
-
-  } catch (error) {
-    // 🎯 YENİ EKLEDİĞİMİZ SATIR: Log ile Trace'i birbirine bağlıyoruz
-    const traceId = anaSpan.spanContext().traceId;
-    console.error(`🚨 [HATA] [TraceID: ${traceId}] İşlem Başarısız: ${error.message}`);
-    logger.error({ message: `Sistemde kritik bir hata oluştu: ${error.message}` });
-
-    anaSpan.setStatus({ code: opentelemetry.SpanStatusCode.ERROR, message: error.message });
-    anaSpan.recordException(error);
-    res.status(400).json({ success: false, message: error.message });
-  } finally {
-    anaSpan.end();
-  }
+  });
 });
 
 const PORT = 3000;

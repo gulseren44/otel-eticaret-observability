@@ -12,6 +12,7 @@ const sdk = new NodeSDK({
   }),
   metricReader: new PrometheusExporter({
     port: 9464, // Prometheus metrikleri buradan dinleyecek
+    disableExemplars: false // 🚀 İŞTE ARADIĞIMIZ SİHİRLİ DOKUNUŞ BURASI!
   }),
   instrumentations: [
     new HttpInstrumentation(),
